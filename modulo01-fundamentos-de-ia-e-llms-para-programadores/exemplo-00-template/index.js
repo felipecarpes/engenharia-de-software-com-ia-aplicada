@@ -40,11 +40,11 @@ async function trainModel(inputXs, outputYs) {
     verbose: 0, // Desativa a saída detalhada do treinamento
     epochs: 100, // Número de épocas para treinar o modelo
     shuffle: true, // Embaralha os dados a cada época para melhorar a generalização do modelo
-    callbacks: {
-      onEpochEnd: (epoch, logs) => {
-        console.log(`Epoch ${epoch + 1}: loss = ${logs.loss.toFixed(4)}, accuracy = ${logs.acc.toFixed(4)}`);
-      },
-    },
+    // callbacks: {
+    //   onEpochEnd: (epoch, logs) => {
+    //     console.log(`Epoch ${epoch + 1}: loss = ${logs.loss.toFixed(4)}, accuracy = ${logs.acc.toFixed(4)}`);
+    //   },
+    // },
   });
 
   return model;
