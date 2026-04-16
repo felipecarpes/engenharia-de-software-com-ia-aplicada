@@ -3,7 +3,7 @@ import { workerEvents } from "../events/constants.js";
 
 console.log("Model training worker initialized");
 let _globalCtx = {};
-let _model = {};
+let _model = null;
 
 const WEIGHTS = {
   category: 0.4,
@@ -36,7 +36,7 @@ function makeContext(products, users) {
   );
 
   // Computar a média de idade dos compradores por produto
-  //   ajuda a personalizar as recomendações com base na faixa etária dos usuários que compraram um produto específico.
+  // ajuda a personalizar as recomendações com base na faixa etária dos usuários que compraram um produto específico.
 
   const midAge = (minAge + maxAge) / 2;
   const ageSums = {};
@@ -106,13 +106,22 @@ function encodeProduct(product, context) {
 }
 
 function encodeUser(user, context) {
-  if (user.purchases.length === 0) {
-    return tf.zeros([1, context.dimentions]);
+  if (user.purchases.length) {
+    return tf
+      .stack(user.purchases.map((product) => encodeProduct(product, context)))
+      .mean(0)
+      .reshape([1, context.dimentions]);
   }
 
   return tf
-    .stack(user.purchases.map((product) => encodeProduct(product, context)))
-    .mean(0)
+    .concat1d([
+      tf.zeros([1]), // preço é ignorado,
+      tf.tensor1d([
+        normalize(user.age, context.minAge, context.maxAge) * WEIGHTS.age,
+      ]),
+      tf.zeros([context.categoriesQty]), // categoria ignorada,
+      tf.zeros([context.colorsQty]), // color ignorada,
+    ])
     .reshape([1, context.dimentions]);
 }
 
@@ -143,9 +152,50 @@ function createTrainData(context) {
   };
 }
 
+// ====================================================================
+// 📌 Exemplo de como um usuário é ANTES da codificação
+// ====================================================================
+/*
+const exampleUser = {
+    id: 201,
+    name: 'Rafael Souza',
+    age: 27,
+    purchases: [
+        { id: 8, name: 'Boné Estiloso', category: 'acessórios', price: 39.99, color: 'preto' },
+        { id: 9, name: 'Mochila Executiva', category: 'acessórios', price: 159.99, color: 'cinza' }
+    ]
+};
+*/
+
+// ====================================================================
+// 📌 Após a codificação, o modelo NÃO vê nomes ou palavras.
+// Ele vê um VETOR NUMÉRICO (todos normalizados entre 0–1).
+// Exemplo: [preço_normalizado, idade_normalizada, cat_one_hot..., cor_one_hot...]
+//
+// Suponha categorias = ['acessórios', 'eletrônicos', 'vestuário']
+// Suponha cores      = ['preto', 'cinza', 'azul']
+//
+// Para Rafael (idade 27, categoria: acessórios, cores: preto/cinza),
+// o vetor poderia ficar assim:
+//
+// [
+//   0.45,            // peso do preço normalizado
+//   0.60,            // idade normalizada
+//   1, 0, 0,         // one-hot de categoria (acessórios = ativo)
+//   1, 0, 0          // one-hot de cores (preto e cinza ativos, azul inativo)
+// ]
+//
+// São esses números que vão para a rede neural.
+// ====================================================================
+
 async function configureNeuralNetworkAndTrain(trainData) {
   const model = tf.sequential();
 
+  // Camada de entrada
+  // - inputShape: Número de features por exemplo de treino (trainData.inputDim)
+  //   Exemplo: Se o vetor produto + usuário = 20 números, então inputDim = 20
+  // - units: 128 neurônios (muitos "olhos" para detectar padrões)
+  // - activation: 'relu' (mantém apenas sinais positivos, ajuda a aprender padrões não-lineares)
   model.add(
     tf.layers.dense({
       inputShape: [trainData.inputDimention],
@@ -154,8 +204,19 @@ async function configureNeuralNetworkAndTrain(trainData) {
     }),
   );
 
+  // Camada oculta 1
+  // - 64 neurônios (menos que a primeira camada: começa a comprimir informação)
+  // - activation: 'relu' (ainda extraindo combinações relevantes de features)
   model.add(tf.layers.dense({ units: 64, activation: "relu" }));
+  // Camada oculta 2
+  // - 32 neurônios (mais estreita de novo, destilando as informações mais importantes)
+  //   Exemplo: De muitos sinais, mantém apenas os padrões mais fortes
+  // - activation: 'relu'
   model.add(tf.layers.dense({ units: 32, activation: "relu" }));
+  // Camada de saída
+  // - 1 neurônio porque vamos retornar apenas uma pontuação de recomendação
+  // - activation: 'sigmoid' comprime o resultado para o intervalo 0–1
+  //   Exemplo: 0.9 = recomendação forte, 0.1 = recomendação fraca
   model.add(tf.layers.dense({ units: 1, activation: "sigmoid" }));
 
   model.compile({
@@ -221,13 +282,54 @@ async function trainModel({ users }) {
   postMessage({ type: workerEvents.trainingComplete });
 }
 
-function recommend(user, ctx) {
-  console.log("will recommend for user:", user);
-  // postMessage({
-  //     type: workerEvents.recommend,
-  //     user,
-  //     recommendations: []
-  // });
+function recommend(user) {
+  if (!_model) return;
+  const context = _globalCtx;
+  // 1️⃣ Converta o usuário fornecido no vetor de features codificadas
+  //    (preço ignorado, idade normalizada, categorias ignoradas)
+  //    Isso transforma as informações do usuário no mesmo formato numérico
+  //    que foi usado para treinar o modelo.
+  const userVector = encodeUser(user, context).dataSync();
+  // Em aplicações reais:
+  //  Armazene todos os vetores de produtos em um banco de dados vetorial (como Postgres, Neo4j ou Pinecone)
+  //  Consulta: Encontre os 200 produtos mais próximos do vetor do usuário
+  //  Execute _model.predict() apenas nesses produtos
+
+  // 2️⃣ Crie pares de entrada: para cada produto, concatene o vetor do usuário
+  //    com o vetor codificado do produto.
+  //    Por quê? O modelo prevê o "score de compatibilidade" para cada par (usuário, produto).
+
+  const inputs = context.productVectors.map(({ vector }) => {
+    return [...userVector, ...vector];
+  });
+
+  // 3️⃣ Converta todos esses pares (usuário, produto) em um único Tensor.
+  //    Formato: [numProdutos, inputDim]
+  const inputTensor = tf.tensor2d(inputs);
+
+  // 4️⃣ Rode a rede neural treinada em todos os pares (usuário, produto) de uma vez.
+  //    O resultado é uma pontuação para cada produto entre 0 e 1.
+  //    Quanto maior, maior a probabilidade do usuário querer aquele produto.
+  const predictions = _model.predict(inputTensor);
+
+  // 5️⃣ Extraia as pontuações para um array JS normal.
+  const scores = predictions.dataSync();
+  const recommendations = context.productVectors.map((item, index) => {
+    return {
+      ...item.meta,
+      name: item.name,
+      score: scores[index], // previsão do modelo para este produto
+    };
+  });
+  const sortedItems = recommendations.sort((a, b) => b.score - a.score);
+
+  // 8️⃣ Envie a lista ordenada de produtos recomendados
+  //    para a thread principal (a UI pode exibi-los agora).
+  postMessage({
+    type: workerEvents.recommend,
+    user,
+    recommendations: sortedItems,
+  });
 }
 
 const handlers = {
